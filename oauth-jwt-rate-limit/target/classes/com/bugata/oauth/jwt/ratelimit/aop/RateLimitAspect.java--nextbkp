@@ -1,0 +1,102 @@
+package com.bugata.oauth.jwt.ratelimit.aop;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Component;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
+
+@Aspect
+@Component
+public class RateLimitAspect {
+
+	private final Map<String, Instant> requestTimestamps = new ConcurrentHashMap<>();
+	private final Map<String, Integer> requestCounts = new ConcurrentHashMap<>();
+
+	@Value("${ratelimit.window.seconds}")
+	private int rateLimitWindowSeconds;
+
+	@Value("${ratelimit.max.requests}")
+	private int rateLimitMaxRequests;
+
+	@Around("@annotation(com.bugata.oauth.jwt.ratelimit.config.RateLimit)")
+	public Object rateLimitCheck(ProceedingJoinPoint joinPoint) throws Throwable {
+		ServletRequestAttributes requestAttributes = (ServletRequestAttributes) RequestContextHolder
+				.getRequestAttributes();
+		HttpServletRequest request = requestAttributes.getRequest();
+		HttpServletResponse response = requestAttributes.getResponse();
+
+		String clientId = request.getHeader("X-Client-Id");
+		String endpoint = request.getRequestURI();
+
+		String key = clientId + ":" + endpoint;
+		key = "krnsa";
+		System.out.println(key);
+		Instant now = Instant.now();
+
+		// Remove expired entries from requestTimestamps
+		requestTimestamps.entrySet()
+				.removeIf(entry -> entry.getValue().isBefore(now.minusSeconds(rateLimitWindowSeconds)));
+
+		// Increment request count for the client and endpoint
+		requestCounts.putIfAbsent(key, 0);
+		requestCounts.computeIfPresent(key, (k, v) -> v + 1);
+
+		int requestCount = requestCounts.get(key);
+		
+		String resetTime=String.valueOf(calculateResetTime());
+
+		// Check if request count exceeds rate limit
+		if (requestCount > rateLimitMaxRequests) {
+			HttpHeaders headers = new HttpHeaders();
+			headers.add("RateLimit-Limit", String.valueOf(rateLimitMaxRequests));
+			headers.add("RateLimit-Remaining", "0");
+			//headers.add("RateLimit-Reset", String.valueOf(calculateResetTime()));
+			headers.add("RateLimit-Reset", resetTime);
+
+			response.setHeader("RateLimit-Limit", String.valueOf(rateLimitMaxRequests));
+			response.setHeader("RateLimit-Remaining", "0");
+		//	response.setHeader("RateLimit-Reset", String.valueOf(calculateResetTime()));
+			response.setHeader("RateLimit-Reset", resetTime);
+			response.setHeader("Retry-After", String.valueOf(calculateRetryAfter()));
+			response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+			response.getWriter().write("Rate limit exceeded. Try again later.");
+			return null;
+		}
+
+		// Update request timestamp for the client and endpoint
+		requestTimestamps.put(key, now);
+
+		// Calculate Retry-After based on rate limit window
+		response.setHeader("RateLimit-Limit", String.valueOf(rateLimitMaxRequests));
+		response.setHeader("RateLimit-Remaining", String.valueOf(rateLimitMaxRequests - requestCount));
+		//response.setHeader("RateLimit-Reset", String.valueOf(calculateResetTime()));
+		response.setHeader("RateLimit-Reset", resetTime);
+		response.setHeader("Retry-After", String.valueOf(calculateRetryAfter()));
+
+		System.out.println(response.getHeader("RateLimit-Limit"));
+		return joinPoint.proceed(); // Proceed with the method execution
+	}
+
+	private long calculateResetTime() {
+		Instant oldestRequestTime = Instant.now().minusSeconds(rateLimitWindowSeconds);
+		Instant nextResetTime = oldestRequestTime.plusSeconds(rateLimitWindowSeconds);
+		return Duration.between(Instant.now(), nextResetTime).getSeconds();
+	}
+
+	private long calculateRetryAfter() {
+		return rateLimitWindowSeconds;
+	}
+}
